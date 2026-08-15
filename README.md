@@ -21,3 +21,16 @@ Output tables and figures will be generated locally under `results/` and `result
 
 ## Contact
 Corresponding author: lizhg@lzu.edu.cn
+
+## MR Reporting Standard (STROBE-MR Checklist Compliance)
+
+This two-sample multi-tissue MR analysis fully adheres to the STROBE-MR reporting guidelines. All analytical steps required by the checklist are explicitly implemented in `analysis_pipeline.R`, including:
+
+1. SNP instrument selection (P-value threshold, LD clumping parameters for EUR population)
+2. Allele harmonisation, strand correction and palindromic variant handling
+3. Multiple MR estimators (IVW, MR-Egger)
+4. Heterogeneity test, horizontal pleiotropy diagnostic
+5. External replication with consistent effect-direction filtering
+6. TCGA expression exploratory follow-up
+
+All software versions, dataset download links and LD reference panel information are documented within this repository (`sessionInfo.txt`, `data/README_data.txt`).

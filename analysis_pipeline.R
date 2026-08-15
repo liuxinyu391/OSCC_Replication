@@ -470,10 +470,24 @@ integrated_exploratory <- integrate_evidence(mr_blood, mr_eso, mr_muscle, mr_sal
 integrated <- fread("results/integrated_genes_nominal_exploratory.csv")
 AB_genes <- integrated[grade %in% c("A","B"), gene]; C_genes <- integrated[grade=="C", gene]
 
+library(org.Hs.eg.db)
+library(clusterProfiler)
+library(data.table)
+
+all_genes_ens <- unique(integrated$gene)
+genes_clean <- sub("\\..*", "", all_genes_ens)
+anno <- bitr(genes_clean, fromType = "ENSEMBL",
+             toType = c("SYMBOL", "ENTREZID", "GENETYPE"),
+             OrgDb = org.Hs.eg.db)
+setDT(anno)
+setnames(anno, "ENSEMBL", "gene")
+fwrite(anno, "results/gene_annotation.csv")
+cat("✅ 基因注释文件已保存至 results/gene_annotation.csv\n")
+
 # ========================== 4. Co-localization analysis============================================== 
 cat("\n===== 4. Co-localization analysis =====\n")
 
-# ---------- 4.1 Single-gene colocalization function数 ----------
+# ---------- 4.1 Single-gene colocalization function ----------
 coloc_one_gene <- function(g, eqtl_data, sample_size) {
   gene_eqtl <- eqtl_data[gene == g, ]
   if (nrow(gene_eqtl) == 0) return(NULL)
@@ -618,15 +632,233 @@ fwrite(table3, "results/Table3_Summary.csv")
 print(table3)
 cat("✅ 共定位分析及汇总表格全部完成\n")
 
+if (!exists("anno") || is.null(anno) || !is.data.table(anno)) {
+  if (file.exists("results/gene_annotation.csv")) {
+    anno <- fread("results/gene_annotation.csv")
+    setDT(anno)
+    cat("✅ 已加载注释数据\n")
+  } else {
+    stop("❌ 请先运行生成 anno 的代码，或确保 results/gene_annotation.csv 存在。")
+  }
+}
+if (!all(c("gene", "SYMBOL") %in% names(anno))) {
+  stop("❌ anno 缺少 'gene' 或 'SYMBOL' 列")
+}
 
+#  1. A级基因小唾液腺共定位 
+cat("\n=== 补充：A级基因小唾液腺共定位 ===\n")
+A_genes <- integrated[grade == "A", gene]
+coloc_A_sal <- NULL
+if (length(A_genes) > 0) {
+  coloc_A_sal <- run_coloc_batch(A_genes, eqtl_sal, 100, "A_sal")
+  if (!is.null(coloc_A_sal) && nrow(coloc_A_sal) > 0) {
+    cols_keep <- setdiff(names(coloc_A_sal), grep("^SYMBOL", names(coloc_A_sal), value = TRUE))
+    coloc_A_sal_clean <- coloc_A_sal[, ..cols_keep]
+    anno_sub <- anno[, .(gene, SYMBOL)]
+    coloc_A_sal_anno <- merge(coloc_A_sal_clean, anno_sub, by = "gene", all.x = TRUE)
+    # 去重
+    coloc_A_sal_anno <- coloc_A_sal_anno[, .SD[which.max(PP.H4)], by = gene]
+    fwrite(coloc_A_sal_anno, "results/coloc_A_sal.csv")
+    cat("✅ A级唾液腺共定位结果已保存: results/coloc_A_sal.csv\n")
+  } else {
+    cat("⚠️ A级基因共定位无结果\n")
+  }
+} else {
+  cat("⚠️ 无A级基因\n")
+}
 
+#  2. B级基因小唾液腺共定位 
+cat("\n=== 补充：B级基因小唾液腺共定位 ===\n")
+B_genes <- integrated[grade == "B", gene]
+coloc_B_sal <- NULL
+if (length(B_genes) > 0) {
+  coloc_B_sal <- run_coloc_batch(B_genes, eqtl_sal, 100, "B_sal")
+  if (!is.null(coloc_B_sal) && nrow(coloc_B_sal) > 0) {
+    cols_keep <- setdiff(names(coloc_B_sal), grep("^SYMBOL", names(coloc_B_sal), value = TRUE))
+    coloc_B_sal_clean <- coloc_B_sal[, ..cols_keep]
+    anno_sub <- anno[, .(gene, SYMBOL)]
+    coloc_B_sal_anno <- merge(coloc_B_sal_clean, anno_sub, by = "gene", all.x = TRUE)
+    # 去重
+    coloc_B_sal_anno <- coloc_B_sal_anno[, .SD[which.max(PP.H4)], by = gene]
+    fwrite(coloc_B_sal_anno, "results/coloc_B_sal.csv")
+    cat("✅ B级唾液腺共定位结果已保存: results/coloc_B_sal.csv\n")
+  } else {
+    cat("⚠️ B级基因共定位无结果\n")
+  }
+} else {
+  cat("⚠️ 无B级基因\n")
+}
 
+#  3. A vs B 共定位支持率 Fisher 检验 
+cat("\n=== A vs B 共定位支持率比较 ===\n")
+# 重新读取去重后的文件（确保数据正确）
+if (file.exists("results/coloc_A_sal.csv")) {
+  coloc_A_sal <- fread("results/coloc_A_sal.csv")
+  setDT(coloc_A_sal)
+}
+if (file.exists("results/coloc_B_sal.csv")) {
+  coloc_B_sal <- fread("results/coloc_B_sal.csv")
+  setDT(coloc_B_sal)
+}
 
+# 强制过滤，只保留属于当前分级的基因
+coloc_A_valid <- coloc_A_sal[gene %in% A_genes, ]
+coloc_B_valid <- coloc_B_sal[gene %in% B_genes, ]
 
+A_total <- nrow(coloc_A_valid)
+B_total <- nrow(coloc_B_valid)
+A_support <- sum(coloc_A_valid$PP.H4 >= 0.5, na.rm = TRUE)
+B_support <- sum(coloc_B_valid$PP.H4 >= 0.5, na.rm = TRUE)
 
+cat("A级基因总数:", length(A_genes), "\n")
+cat("A级共定位成功数:", A_total, "\n")
+cat("B级基因总数:", length(B_genes), "\n")
+cat("B级共定位成功数:", B_total, "\n")
 
+if (A_total > 0 && B_total > 0) {
+  mat <- matrix(c(A_support, A_total - A_support,
+                  B_support, B_total - B_support), nrow = 2, byrow = TRUE)
+  fisher_res <- fisher.test(mat)
+  cat(sprintf("A级支持率: %d/%d = %.1f%%\n", A_support, A_total, 100*A_support/A_total))
+  cat(sprintf("B级支持率: %d/%d = %.1f%%\n", B_support, B_total, 100*B_support/B_total))
+  cat("Fisher 检验 P =", fisher_res$p.value, "\n")
+  fisher_out <- data.table(Comparison = "A_vs_B_Support", 
+                           A_rate = paste0(A_support, "/", A_total),
+                           B_rate = paste0(B_support, "/", B_total),
+                           P_value = fisher_res$p.value)
+  fwrite(fisher_out, "results/A_vs_B_coloc_fisher.csv")
+} else {
+  cat("⚠️ A或B级共定位数据不足，无法比较\n")
+}
 
+#  4. 更新表3（添加A/B级共定位统计行） 
+cat("\n=== 更新表3：添加A/B级共定位统计 ===\n")
+if (file.exists("results/Table3_Summary.csv")) {
+  table3 <- fread("results/Table3_Summary.csv")
+} else {
+  table3 <- data.table()
+}
 
+new_rows <- rbind(
+  data.table(GeneSet = "A级（唾液腺）", 
+             TotalGenes = length(A_genes),
+             ColocSuccess = A_total,
+             ColocSupport = A_support,
+             StrongSupport = sum(coloc_A_valid$PP.H4 > 0.8, na.rm = TRUE)),
+  data.table(GeneSet = "B级（唾液腺）",
+             TotalGenes = length(B_genes),
+             ColocSuccess = B_total,
+             ColocSupport = B_support,
+             StrongSupport = sum(coloc_B_valid$PP.H4 > 0.8, na.rm = TRUE))
+)
+
+table3 <- table3[!GeneSet %in% c("A级（唾液腺）", "B级（唾液腺）")]
+table3 <- rbind(table3, new_rows, fill = TRUE)
+fwrite(table3, "results/Table3_Summary_updated.csv")
+cat("✅ 更新后的表3已保存: results/Table3_Summary_updated.csv\n")
+print(table3)
+
+#  5. B级基因选择偏倚分析
+cat("\n=== B级基因选择偏倚分析（补充表15a）最终修正版 ===\n")
+
+B_genes_all <- integrated[grade == "B", gene]
+success_genes <- unique(coloc_B_valid$gene)
+fail_genes <- setdiff(B_genes_all, success_genes)
+cat("B级成功分析基因数:", length(success_genes), "\n")
+cat("B级失败分析基因数:", length(fail_genes), "\n")
+
+if (length(success_genes) > 0 || length(fail_genes) > 0) {
+  # 基因位置信息
+  if (!exists("eqtl_sal") || is.null(eqtl_sal)) {
+    eqtl_sal <- readRDS("data/GTEx_clean/Minor_Salivary_Gland_all_eqtl.rds")
+  }
+  eqtl_sal[, chr_num := as.integer(gsub("chr", "", chr))]
+  eqtl_sal <- eqtl_sal[!is.na(chr_num) & chr_num %in% 1:22]
+  eqtl_sal[, gene_clean := sub("\\..*", "", gene)]
+  gene_pos <- eqtl_sal[, .(chromosome = first(chr_num),
+                           min_pos = min(pos, na.rm = TRUE),
+                           max_pos = max(pos, na.rm = TRUE)), by = gene_clean]
+  setnames(gene_pos, "gene_clean", "gene")
+  gene_pos[, gene_length := max_pos - min_pos]
+  gene_pos[, is_mhc := ifelse(chromosome == 6 & min_pos >= 28500000 & max_pos <= 33500000, TRUE, FALSE)]
+  
+  # 合并分组
+  all_genes <- data.table(gene = c(success_genes, fail_genes),
+                          group = c(rep("Success", length(success_genes)), 
+                                    rep("Fail", length(fail_genes))))
+  all_genes[, gene_clean := sub("\\..*", "", gene)]
+  gene_info <- merge(all_genes, gene_pos, by.x = "gene_clean", by.y = "gene", all.x = TRUE)
+  gene_info_clean <- gene_info[!is.na(chromosome)]
+  
+  # 合并 GENETYPE（关键：使用正确的 "protein-coding" 字符串）
+  anno[, gene_clean := sub("\\..*", "", gene)]
+  gene_info_clean <- merge(gene_info_clean, anno[, .(gene_clean, GENETYPE)], 
+                           by = "gene_clean", all.x = TRUE)
+  
+  # 使用正确的蛋白编码字符串 "protein-coding"（带连字符）
+  protein_coding_string <- "protein-coding"
+  pc_success <- sum(gene_info_clean[group == "Success", GENETYPE == protein_coding_string], na.rm = TRUE)
+  pc_fail <- sum(gene_info_clean[group == "Fail", GENETYPE == protein_coding_string], na.rm = TRUE)
+  total_success <- length(success_genes)
+  total_fail <- length(fail_genes)
+  pc_ratio_success <- pc_success / total_success * 100
+  pc_ratio_fail <- pc_fail / total_fail * 100
+  
+  cat("成功组蛋白编码:", pc_success, "/", total_success, "=", round(pc_ratio_success, 1), "%\n")
+  cat("失败组蛋白编码:", pc_fail, "/", total_fail, "=", round(pc_ratio_fail, 1), "%\n")
+  
+  pc_pval <- fisher.test(matrix(c(pc_success, total_success - pc_success,
+                                  pc_fail, total_fail - pc_fail), nrow = 2))$p.value
+  
+  # 基因长度检验
+  gene_len_clean <- gene_info_clean[!is.na(gene_length) & gene_length > 0]
+  if (nrow(gene_len_clean) > 0) {
+    wilcox_p <- wilcox.test(gene_length ~ group, data = gene_len_clean)$p.value
+    median_success <- median(gene_len_clean[group == "Success", gene_length] / 1000, na.rm = TRUE)
+    median_fail <- median(gene_len_clean[group == "Fail", gene_length] / 1000, na.rm = TRUE)
+    iqr_success <- IQR(gene_len_clean[group == "Success", gene_length] / 1000, na.rm = TRUE)
+    iqr_fail <- IQR(gene_len_clean[group == "Fail", gene_length] / 1000, na.rm = TRUE)
+  } else {
+    wilcox_p <- median_success <- median_fail <- iqr_success <- iqr_fail <- NA
+  }
+  
+  # MHC区域比例
+  mhc_success <- sum(gene_info_clean[group == "Success", is_mhc], na.rm = TRUE)
+  mhc_fail <- sum(gene_info_clean[group == "Fail", is_mhc], na.rm = TRUE)
+  mhc_pval <- fisher.test(matrix(c(mhc_success, total_success - mhc_success,
+                                   mhc_fail, total_fail - mhc_fail), nrow = 2))$p.value
+  
+  # 染色体分布检验
+  chr_count <- gene_info_clean[, .N, by = .(group, chromosome)]
+  chr_wide <- dcast(chr_count, chromosome ~ group, value.var = "N", fill = 0)
+  chisq_p <- tryCatch(chisq.test(chr_wide[, .(Success, Fail)], simulate.p.value = TRUE)$p.value,
+                      error = function(e) NA)
+  
+  # 生成补充表15a
+  table15a <- data.frame(
+    Feature = c("染色体分布 (χ²检验)",
+                "基因长度 (kb, 中位数 [IQR])",
+                "位于MHC区域比例 (%)",
+                "蛋白编码基因比例 (%)"),
+    Success_group = c(if (is.na(chisq_p)) "NA" else paste0("P = ", round(chisq_p, 4)),
+                      paste0(round(median_success, 1), " [", round(iqr_success, 1), "]"),
+                      paste0(round(100*mhc_success/total_success, 1), "% (", mhc_success, "/", total_success, ")"),
+                      paste0(round(pc_ratio_success, 1), "% (", pc_success, "/", total_success, ")")),
+    Fail_group = c("",
+                   paste0(round(median_fail, 1), " [", round(iqr_fail, 1), "]"),
+                   paste0(round(100*mhc_fail/total_fail, 1), "% (", mhc_fail, "/", total_fail, ")"),
+                   paste0(round(pc_ratio_fail, 1), "% (", pc_fail, "/", total_fail, ")")),
+    P_value = c(round(chisq_p, 4), round(wilcox_p, 4), round(mhc_pval, 4), round(pc_pval, 4))
+  )
+  dir.create("results/selection_bias_B", showWarnings = FALSE)
+  fwrite(table15a, "results/selection_bias_B/Supplementary_Table15a_B_selection_bias.csv")
+  cat("✅ 补充表15a已保存至 results/selection_bias_B/Supplementary_Table15a_B_selection_bias.csv\n")
+  print(table15a)
+} else {
+  cat("⚠️ 无B级基因或共定位数据，跳过偏倚分析\n")
+}
+
+cat("\n========== 所有补充分析完成 ==========\n")
 # ========================== 5. External validation ==========================
 # ---------- 5.1 Single-gene validation function ----------
 validate_gene <- function(g, eqtl_data, gwas_data) {

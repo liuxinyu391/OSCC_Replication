@@ -758,11 +758,11 @@ fwrite(table3, "results/Table3_Summary_updated.csv")
 cat("✅ 更新后的表3已保存: results/Table3_Summary_updated.csv\n")
 print(table3)
 
-#  5. B级基因选择偏倚分析
+# 5. B级基因选择偏倚分析
 cat("\n=== B级基因选择偏倚分析（补充表15a）最终修正版 ===\n")
 
 B_genes_all <- integrated[grade == "B", gene]
-success_genes <- unique(coloc_B_valid$gene)
+success_genes <- if (!is.null(coloc_B_sal)) unique(coloc_B_sal$gene) else c()
 fail_genes <- setdiff(B_genes_all, success_genes)
 cat("B级成功分析基因数:", length(success_genes), "\n")
 cat("B级失败分析基因数:", length(fail_genes), "\n")
@@ -782,7 +782,7 @@ if (length(success_genes) > 0 || length(fail_genes) > 0) {
   gene_pos[, gene_length := max_pos - min_pos]
   gene_pos[, is_mhc := ifelse(chromosome == 6 & min_pos >= 28500000 & max_pos <= 33500000, TRUE, FALSE)]
   
-  # 合并分组
+  # 合并分组（用于位置相关统计）
   all_genes <- data.table(gene = c(success_genes, fail_genes),
                           group = c(rep("Success", length(success_genes)), 
                                     rep("Fail", length(fail_genes))))
@@ -790,15 +790,18 @@ if (length(success_genes) > 0 || length(fail_genes) > 0) {
   gene_info <- merge(all_genes, gene_pos, by.x = "gene_clean", by.y = "gene", all.x = TRUE)
   gene_info_clean <- gene_info[!is.na(chromosome)]
   
-  # 合并 GENETYPE（关键：使用正确的 "protein-coding" 字符串）
+  # ==================== 蛋白编码统计（不依赖位置信息） ====================
+  # 准备 anno 查找表
   anno[, gene_clean := sub("\\..*", "", gene)]
-  gene_info_clean <- merge(gene_info_clean, anno[, .(gene_clean, GENETYPE)], 
-                           by = "gene_clean", all.x = TRUE)
+  anno_lookup <- unique(anno[, .(gene_clean, GENETYPE)])
   
-  # 使用正确的蛋白编码字符串 "protein-coding"（带连字符）
-  protein_coding_string <- "protein-coding"
-  pc_success <- sum(gene_info_clean[group == "Success", GENETYPE == protein_coding_string], na.rm = TRUE)
-  pc_fail <- sum(gene_info_clean[group == "Fail", GENETYPE == protein_coding_string], na.rm = TRUE)
+  # 直接从 anno 匹配所有基因（不经过位置过滤）
+  success_genes_clean <- sub("\\..*", "", success_genes)
+  fail_genes_clean <- sub("\\..*", "", fail_genes)
+  
+  pc_success <- sum(anno_lookup[gene_clean %in% success_genes_clean, GENETYPE == "protein-coding"], na.rm = TRUE)
+  pc_fail <- sum(anno_lookup[gene_clean %in% fail_genes_clean, GENETYPE == "protein-coding"], na.rm = TRUE)
+  
   total_success <- length(success_genes)
   total_fail <- length(fail_genes)
   pc_ratio_success <- pc_success / total_success * 100
@@ -809,8 +812,9 @@ if (length(success_genes) > 0 || length(fail_genes) > 0) {
   
   pc_pval <- fisher.test(matrix(c(pc_success, total_success - pc_success,
                                   pc_fail, total_fail - pc_fail), nrow = 2))$p.value
+  # =======================================================================
   
-  # 基因长度检验
+  # 基因长度检验（需要位置信息）
   gene_len_clean <- gene_info_clean[!is.na(gene_length) & gene_length > 0]
   if (nrow(gene_len_clean) > 0) {
     wilcox_p <- wilcox.test(gene_length ~ group, data = gene_len_clean)$p.value
@@ -857,7 +861,6 @@ if (length(success_genes) > 0 || length(fail_genes) > 0) {
 } else {
   cat("⚠️ 无B级基因或共定位数据，跳过偏倚分析\n")
 }
-
 cat("\n========== 所有补充分析完成 ==========\n")
 # ========================== 5. External validation ==========================
 # ---------- 5.1 Single-gene validation function ----------

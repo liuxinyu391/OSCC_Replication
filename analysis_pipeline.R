@@ -1581,6 +1581,469 @@ for (feat in colnames(immune_scores)) {
 fwrite(bootstrap_results, "results/TCGA/Table_Spearman_CI.csv", row.names = FALSE)
 print(bootstrap_results)
 cat("✅ Bootstrap 置信区间计算完成\n")
+# =========================7. （NEW_whole）TCGA Oral Cavity Tissue Validation===================================================
+# ============================================================================
+# This module performs:
+#   1. Re-download of TCGA-HNSC STAR-Counts into a clean directory
+#   2. Strict integrity check (no NA counts)
+#   3. Differential expression analysis for 11 priority I genes (DESeq2)
+#   4. Protective gene score vs immune cell feature correlations
+#   5. Partial correlation with immune score adjustment
+#   6. Leave-one-out sensitivity analysis for CD8/NK reversal
+#   7. Bootstrap 95% CI for Spearman correlations
+#   8. Cell-type specificity overlap analysis
+#   9. Permutation test for protective score correlations (10,000 iterations)
+#  10. Risk score control and permutation test
+#  11. Figure generation (boxplot, heatmap)
+# ============================================================================
+
+# ---------- Setup ----------
+if (!exists("WORK_DIR")) WORK_DIR <- "E:/OSCC_Replication"
+
+DATA_DIR    <- file.path(WORK_DIR, "data", "TCGA_Clean")
+PROJECT_DIR <- file.path(WORK_DIR, "results", "TCGA")
+FIG_DIR     <- file.path(WORK_DIR, "results", "figures")
+dir.create(DATA_DIR, showWarnings = FALSE, recursive = TRUE)
+dir.create(PROJECT_DIR, showWarnings = FALSE, recursive = TRUE)
+dir.create(FIG_DIR, showWarnings = FALSE, recursive = TRUE)
+
+mr_file <- file.path(WORK_DIR, "results", "MR_results_Esophagus_Mucosa.csv")
+if (!file.exists(mr_file)) stop("MR results file not found: ", mr_file)
+
+# Required packages
+required_pkgs <- c(
+  "TCGAbiolinks", "SummarizedExperiment", "DESeq2", "edgeR",
+  "data.table", "ggplot2", "pheatmap", "ppcor",
+  "org.Hs.eg.db", "boot"
+)
+for (pkg in required_pkgs) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    if (pkg %in% c("TCGAbiolinks", "SummarizedExperiment", "DESeq2", "edgeR", "org.Hs.eg.db")) {
+      BiocManager::install(pkg, update = FALSE, ask = FALSE)
+    } else {
+      install.packages(pkg, dependencies = TRUE)
+    }
+  }
+  library(pkg, character.only = TRUE)
+}
+
+# ---------- 1. Query and download TCGA-HNSC data ----------
+cat("Querying TCGA-HNSC STAR-Counts data...\n")
+query <- GDCquery(
+  project = "TCGA-HNSC",
+  data.category = "Transcriptome Profiling",
+  data.type = "Gene Expression Quantification",
+  workflow.type = "STAR - Counts",
+  sample.type = c("Primary Tumor", "Solid Tissue Normal")
+)
+
+cat("Downloading to:", DATA_DIR, "\n")
+GDCdownload(
+  query = query,
+  directory = DATA_DIR,
+  method = "api",
+  files.per.chunk = 5
+)
+
+# ---------- 2. Read data and check integrity ----------
+cat("Reading TCGA-HNSC data...\n")
+tcga_data <- GDCprepare(query, directory = DATA_DIR, summarizedExperiment = TRUE)
+
+counts_raw <- assay(tcga_data, "unstranded")
+colnames(counts_raw) <- substr(colnames(counts_raw), 1, 15)
+clinical <- colData(tcga_data)
+
+if (sum(is.na(counts_raw)) > 0) {
+  warning("NA counts detected. Removing affected genes and samples.")
+  na_rows <- apply(counts_raw, 1, function(x) any(is.na(x)))
+  na_cols <- apply(counts_raw, 2, function(x) any(is.na(x)))
+  counts_raw <- counts_raw[!na_rows, !na_cols]
+}
+
+cat("Data loaded: ", nrow(counts_raw), " genes, ", ncol(counts_raw), " samples\n", sep = "")
+
+# ---------- 3. Filter oral cavity subsites ----------
+cat("Filtering oral cavity subsites...\n")
+site_col <- "tissue_or_organ_of_origin"
+oral_keywords <- c(
+  "Ventral surface of tongue", "Upper Gum", "Retromolar area",
+  "Mouth, NOS", "Lip, NOS", "Hard palate", "Gum, NOS",
+  "Floor of mouth", "Cheek mucosa"
+)
+exclude_keywords <- c(
+  "Base of tongue", "Tonsil", "Oropharynx", "Nasopharynx",
+  "Hypopharynx", "Larynx", "Pharynx", "Overlapping"
+)
+is_oral <- grepl(paste(oral_keywords, collapse = "|"), clinical[[site_col]], ignore.case = TRUE) &
+  !grepl(paste(exclude_keywords, collapse = "|"), clinical[[site_col]], ignore.case = TRUE)
+
+oral_clinical <- clinical[is_oral, ]
+rownames(oral_clinical) <- substr(rownames(oral_clinical), 1, 15)
+oral_samples <- colnames(counts_raw)[colnames(counts_raw) %in% rownames(oral_clinical)]
+tumor_samples  <- oral_samples[grep("-01", oral_samples)]
+normal_samples <- oral_samples[grep("-11", oral_samples)]
+cat("Oral tumor samples:", length(tumor_samples), " Normal samples:", length(normal_samples), "\n")
+
+counts_oral <- counts_raw[, c(tumor_samples, normal_samples)]
+
+genes_clean <- sub("\\..*", "", rownames(counts_oral))
+counts_oral <- counts_oral[!duplicated(genes_clean), ]
+rownames(counts_oral) <- genes_clean[!duplicated(genes_clean)]
+
+# ---------- 4. Read MR results and extract gene lists ----------
+mr_eso <- fread(mr_file)
+protective_genes <- mr_eso[ivw_b < 0 & ivw_pval < 0.05, unique(sub("\\..*", "", gene))]
+risk_genes       <- mr_eso[ivw_b > 0 & ivw_pval < 0.05, unique(sub("\\..*", "", gene))]
+cat("Protective genes:", length(protective_genes), "\n")
+cat("Risk genes:", length(risk_genes), "\n")
+
+# ---------- 5. Differential expression analysis for 11 priority genes ----------
+# Read priority I gene list (should contain 11 genes)
+priority_file <- file.path(WORK_DIR, "results", "priority_I_genes.csv")
+if (!file.exists(priority_file)) {
+  stop("priority_I_genes.csv not found. Please run external validation first.")
+}
+priority_I <- fread(priority_file)
+priority_I <- unique(priority_I, by = "gene")
+
+# Convert to symbols for DESeq2 subsetting
+priority_symbols <- mapIds(org.Hs.eg.db,
+                           keys = priority_I$gene,
+                           column = "SYMBOL",
+                           keytype = "ENSEMBL",
+                           multiVals = "first")
+priority_ens <- names(priority_symbols)[!is.na(priority_symbols)]
+
+counts_sub <- counts_oral[rownames(counts_oral) %in% priority_ens, ]
+if (nrow(counts_sub) == 0) stop("No priority genes found in expression matrix.")
+
+sample_info <- data.frame(
+  row.names = c(tumor_samples, normal_samples),
+  group = factor(c(rep("Tumor", length(tumor_samples)),
+                   rep("Normal", length(normal_samples))),
+                 levels = c("Normal", "Tumor"))
+)
+
+dds <- DESeqDataSetFromMatrix(countData = counts_sub,
+                              colData = sample_info,
+                              design = ~ group)
+dds <- DESeq(dds)
+res <- results(dds, contrast = c("group", "Tumor", "Normal"))
+res <- as.data.frame(res[order(res$padj), ])
+res$ensembl <- rownames(res)
+res$symbol  <- mapIds(org.Hs.eg.db, keys = res$ensembl,
+                      column = "SYMBOL", keytype = "ENSEMBL", multiVals = "first")
+
+diff_table <- data.frame(
+  Gene = res$symbol,
+  Ensembl = res$ensembl,
+  log2FC = res$log2FoldChange,
+  pvalue = res$pvalue,
+  padj = res$padj
+)
+write.csv(diff_table, file.path(PROJECT_DIR, "Table_DiffExpression_11Genes_DESeq2.csv"), row.names = FALSE)
+cat("✅ Differential expression table saved.\n")
+
+# Boxplot (VST transformed expression)
+vsd <- varianceStabilizingTransformation(dds, blind = FALSE)
+expr_norm <- assay(vsd)
+
+pdf(file.path(FIG_DIR, "Figure_Boxplot_11Genes.pdf"), width = 14, height = 8)
+par(mfrow = c(3, 4))
+for (g in rownames(expr_norm)) {
+  gene_sym <- mapIds(org.Hs.eg.db, keys = g, column = "SYMBOL", keytype = "ENSEMBL")
+  boxplot(expr_norm[g, ] ~ sample_info$group, main = gene_sym,
+          ylab = "VST expression", xlab = "")
+}
+dev.off()
+cat("✅ Boxplot for 11 priority genes saved.\n")
+
+# ---------- 6. Normalize expression matrix for immune analyses ----------
+dge_all <- DGEList(counts = counts_oral)
+dge_all <- calcNormFactors(dge_all)
+logcpm_all <- cpm(dge_all, log = TRUE, prior.count = 1)
+
+# ---------- 7. Protective gene score ----------
+common_prot <- intersect(protective_genes, rownames(logcpm_all))
+cat("Matched protective genes:", length(common_prot), "\n")
+if (length(common_prot) < 5) stop("Too few protective genes to compute score")
+protective_score <- colMeans(logcpm_all[common_prot, , drop = FALSE])
+
+# ---------- 8. Immune feature scores ----------
+immuno_sets_sym <- list(
+  CD8_T   = c("CD8A", "CD8B", "GZMA", "GZMB", "PRF1"),
+  B_cell  = c("CD19", "CD79A", "CD79B", "MS4A1"),
+  NK      = c("NKG7", "GNLY", "KLRD1", "KLRF1"),
+  M1      = c("NOS2", "IL12A", "IL12B", "TNF", "CCL3"),
+  M2      = c("MRC1", "ARG1", "IL10", "CD163"),
+  DC      = c("CD1C", "CD83", "CCL17", "FCER1A")
+)
+immuno_sets_ens <- lapply(immuno_sets_sym, function(gs) {
+  ids <- mapIds(org.Hs.eg.db, keys = gs, keytype = "SYMBOL", column = "ENSEMBL", multiVals = "first")
+  na.omit(ids)
+})
+immuno_scores <- sapply(immuno_sets_ens, function(gs) {
+  genes_in <- intersect(gs, rownames(logcpm_all))
+  if (length(genes_in) >= 3) {
+    colMeans(logcpm_all[genes_in, , drop = FALSE])
+  } else {
+    rep(NA, ncol(logcpm_all))
+  }
+})
+colnames(immuno_scores) <- names(immuno_sets_ens)
+immuno_scores <- immuno_scores[, !apply(immuno_scores, 2, function(x) all(is.na(x))), drop = FALSE]
+cat("Retained immune features:", ncol(immuno_scores), "\n")
+
+# ---------- 9. Manual immune score (ESTIMATE-like) ----------
+immune_genes <- c(
+  "CD3D","CD3E","CD3G","CD2","CD6","CD7","CD8A","CD8B",
+  "GZMA","GZMB","PRF1","IFNG","TNF","LTB",
+  "CD19","CD79A","CD79B","MS4A1","TNFRSF17","BLK","PAX5",
+  "NKG7","GNLY","KLRD1","KLRF1","KLRB1","NCR1","NCR3",
+  "CD14","CD68","CD163","FCGR3A","FCGR3B","CSF1R",
+  "CD1C","CLEC10A","CLEC4C","FCER1A","NRP1",
+  "HLA-DRA","HLA-DRB1","HLA-DQA1","HLA-DQB1","HLA-DPA1","HLA-DPB1"
+)
+immune_ens <- mapIds(org.Hs.eg.db, keys = immune_genes, column = "ENSEMBL", keytype = "SYMBOL", multiVals = "first")
+immune_ens <- na.omit(immune_ens)
+common_immune <- intersect(immune_ens, rownames(logcpm_all))
+immune_score_manual <- colMeans(logcpm_all[common_immune, , drop = FALSE])
+
+# ---------- 10. Raw and partial Spearman correlations ----------
+partial_results <- data.frame(
+  Feature = character(), raw_rho = numeric(), raw_p = numeric(),
+  partial_rho = numeric(), partial_p = numeric(), stringsAsFactors = FALSE
+)
+for (feat in colnames(immuno_scores)) {
+  if (all(is.na(immuno_scores[, feat]))) next
+  raw_cor <- cor.test(protective_score, immuno_scores[, feat], method = "spearman")
+  partial_cor <- pcor.test(protective_score, immuno_scores[, feat], immune_score_manual, method = "spearman")
+  partial_results <- rbind(partial_results, data.frame(
+    Feature = feat, raw_rho = raw_cor$estimate, raw_p = raw_cor$p.value,
+    partial_rho = partial_cor$estimate, partial_p = partial_cor$p.value
+  ))
+}
+write.csv(partial_results, file.path(PROJECT_DIR, "Table_Immune_Correlation_Partial.csv"), row.names = FALSE)
+print(partial_results)
+
+# ---------- 11. Leave-one-out sensitivity analysis ----------
+cd8_ens <- na.omit(mapIds(org.Hs.eg.db, keys = c("CD8A","CD8B"), column = "ENSEMBL", keytype = "SYMBOL", multiVals = "first"))
+nk_ens  <- na.omit(mapIds(org.Hs.eg.db, keys = c("NKG7","GNLY","KLRD1","KLRF1","NCR1","NCR3"), column = "ENSEMBL", keytype = "SYMBOL", multiVals = "first"))
+sensitivity_res <- data.table()
+for (feat in c("CD8_T", "NK")) {
+  for (adj in c("Full","No_CD8","No_NK","No_Both")) {
+    if (adj == "Full") {
+      score_adj <- immune_score_manual
+    } else if (adj == "No_CD8") {
+      score_adj <- colMeans(logcpm_all[setdiff(common_immune, cd8_ens), , drop = FALSE])
+    } else if (adj == "No_NK") {
+      score_adj <- colMeans(logcpm_all[setdiff(common_immune, nk_ens), , drop = FALSE])
+    } else {
+      score_adj <- colMeans(logcpm_all[setdiff(common_immune, union(cd8_ens, nk_ens)), , drop = FALSE])
+    }
+    pc <- pcor.test(protective_score, immuno_scores[, feat], score_adj, method = "spearman")
+    sensitivity_res <- rbind(sensitivity_res, data.table(
+      Feature = feat, Adjustment = adj, partial_rho = pc$estimate, partial_p = pc$p.value
+    ))
+  }
+}
+write.csv(sensitivity_res, file.path(PROJECT_DIR, "Table_CD8_NK_Sensitivity.csv"), row.names = FALSE)
+print(sensitivity_res)
+
+# ---------- 12. Bootstrap confidence intervals ----------
+set.seed(123)
+bootstrap_results <- data.frame(Feature = character(), rho = numeric(), CI_lower = numeric(), CI_upper = numeric())
+for (feat in colnames(immuno_scores)) {
+  data_boot <- data.frame(prot = protective_score, imm = immuno_scores[, feat])
+  data_boot <- na.omit(data_boot)
+  boot_func <- function(data, indices) cor(data[indices, 1], data[indices, 2], method = "spearman")
+  boot_res <- boot(data_boot, boot_func, R = 1000)
+  ci <- boot.ci(boot_res, type = "perc")
+  bootstrap_results <- rbind(bootstrap_results, data.frame(
+    Feature = feat,
+    rho = cor(data_boot$prot, data_boot$imm, method = "spearman"),
+    CI_lower = if (!is.null(ci)) ci$percent[4] else NA,
+    CI_upper = if (!is.null(ci)) ci$percent[5] else NA
+  ))
+}
+write.csv(bootstrap_results, file.path(PROJECT_DIR, "Table_Spearman_CI.csv"), row.names = FALSE)
+print(bootstrap_results)
+
+# ---------- 13. Cell-type specificity overlap ----------
+immune_lineage_genes <- list(
+  B_cell = c("CD19","CD79A","CD79B","MS4A1","PAX5","BLK"),
+  CD4_T = c("CD4"),
+  CD8_T = c("CD8A","CD8B"),
+  NK_cell = c("NKG7","GNLY","KLRD1","KLRF1","NCR1","NCR3"),
+  Monocyte = c("CD14","FCGR3A","CSF1R"),
+  DC = c("CLEC4C","NR4A1","CLEC10A","FCER1A"),
+  Macrophage = c("CD68","CD163","MRC1")
+)
+immune_lineage_ens <- lapply(immune_lineage_genes, function(gs) {
+  ids <- mapIds(org.Hs.eg.db, keys = gs, keytype = "SYMBOL", column = "ENSEMBL", multiVals = "first")
+  na.omit(ids)
+})
+overlap_results <- data.frame(
+  CellType = names(immune_lineage_ens),
+  LineageGenes = sapply(immune_lineage_ens, length),
+  Overlap = sapply(immune_lineage_ens, function(x) length(intersect(x, common_prot))),
+  OverlapPercent = sapply(immune_lineage_ens, function(x) round(length(intersect(x, common_prot)) / length(x) * 100, 1))
+)
+write.csv(overlap_results, file.path(PROJECT_DIR, "Table_CellType_Specificity.csv"), row.names = FALSE)
+print(overlap_results)
+
+# ---------- 14. Protective score permutation test (10,000 iterations, two-sided) ----------
+set.seed(2024)
+n_permutations <- 10000
+n_protective <- length(common_prot)
+all_genes <- rownames(logcpm_all)
+
+real_cor <- sapply(colnames(immuno_scores), function(feat) {
+  cor.test(protective_score, immuno_scores[, feat], method = "spearman")$estimate
+})
+names(real_cor) <- colnames(immuno_scores)
+
+perm_cor_matrix <- matrix(NA, nrow = n_permutations, ncol = ncol(immuno_scores))
+colnames(perm_cor_matrix) <- colnames(immuno_scores)
+
+cat("Running protective score permutation test (", n_permutations, " iterations)...\n", sep = "")
+pb <- txtProgressBar(min = 0, max = n_permutations, style = 3)
+for (i in 1:n_permutations) {
+  random_genes <- sample(all_genes, size = n_protective, replace = FALSE)
+  random_score <- colMeans(logcpm_all[random_genes, , drop = FALSE])
+  for (feat in colnames(immuno_scores)) {
+    if (all(is.na(immuno_scores[, feat]))) {
+      perm_cor_matrix[i, feat] <- NA
+      next
+    }
+    test <- cor.test(random_score, immuno_scores[, feat], method = "spearman")
+    perm_cor_matrix[i, feat] <- test$estimate
+  }
+  setTxtProgressBar(pb, i)
+}
+close(pb)
+
+empirical_p <- sapply(colnames(immuno_scores), function(feat) {
+  observed <- real_cor[feat]
+  permuted <- na.omit(perm_cor_matrix[, feat])
+  (sum(abs(permuted) >= abs(observed)) + 1) / (length(permuted) + 1)
+})
+permutation_results <- data.frame(
+  Immune_Feature = colnames(immuno_scores),
+  Observed_rho = real_cor,
+  Permutation_Mean = colMeans(perm_cor_matrix, na.rm = TRUE),
+  Permutation_SD = apply(perm_cor_matrix, 2, sd, na.rm = TRUE),
+  Empirical_P = empirical_p,
+  Significant_005 = empirical_p < 0.05
+)
+write.csv(permutation_results, file.path(PROJECT_DIR, "Table_Permutation_Test.csv"), row.names = FALSE)
+saveRDS(perm_cor_matrix, file.path(PROJECT_DIR, "Permutation_Null_Distribution.rds"))
+print(permutation_results)
+
+# ---------- 15. Risk score control and permutation test ----------
+common_risk <- intersect(risk_genes, rownames(logcpm_all))
+cat("Matched risk genes:", length(common_risk), "\n")
+
+if (length(common_risk) >= 5) {
+  risk_score <- colMeans(logcpm_all[common_risk, , drop = FALSE])
+  
+  risk_cor_results <- data.frame(Feature = character(), rho = numeric(), p_value = numeric(), stringsAsFactors = FALSE)
+  for (feat in colnames(immuno_scores)) {
+    if (all(is.na(immuno_scores[, feat]))) next
+    test <- cor.test(risk_score, immuno_scores[, feat], method = "spearman")
+    risk_cor_results <- rbind(risk_cor_results, data.frame(Feature = feat, rho = test$estimate, p_value = test$p.value))
+  }
+  write.csv(risk_cor_results, file.path(PROJECT_DIR, "Table_Risk_Score_Correlation.csv"), row.names = FALSE)
+  
+  prot_cor_vector <- sapply(colnames(immuno_scores), function(feat) {
+    cor.test(protective_score, immuno_scores[, feat], method = "spearman")$estimate
+  })
+  comparison_table <- data.frame(
+    Immune_Feature = colnames(immuno_scores),
+    Protective_rho = prot_cor_vector[colnames(immuno_scores)],
+    Risk_rho = risk_cor_results$rho[match(colnames(immuno_scores), risk_cor_results$Feature)],
+    Risk_p = risk_cor_results$p_value[match(colnames(immuno_scores), risk_cor_results$Feature)]
+  )
+  write.csv(comparison_table, file.path(PROJECT_DIR, "Table_Protective_vs_Risk_Correlation.csv"), row.names = FALSE)
+  
+  # Risk score permutation: 10,000 iterations, two-sided
+  set.seed(2024)
+  n_perm <- 10000
+  n_risk <- length(common_risk)
+  perm_risk_cor <- matrix(NA, nrow = n_perm, ncol = ncol(immuno_scores))
+  colnames(perm_risk_cor) <- colnames(immuno_scores)
+  
+  cat("Running risk score permutation test (", n_perm, " iterations)...\n", sep = "")
+  pb <- txtProgressBar(min = 0, max = n_perm, style = 3)
+  for (i in 1:n_perm) {
+    rand_genes <- sample(all_genes, size = n_risk)
+    rand_score <- colMeans(logcpm_all[rand_genes, , drop = FALSE])
+    for (feat in colnames(immuno_scores)) {
+      if (all(is.na(immuno_scores[, feat]))) {
+        perm_risk_cor[i, feat] <- NA
+        next
+      }
+      test <- cor.test(rand_score, immuno_scores[, feat], method = "spearman")
+      perm_risk_cor[i, feat] <- test$estimate
+    }
+    setTxtProgressBar(pb, i)
+  }
+  close(pb)
+  
+  risk_empirical_p <- sapply(colnames(immuno_scores), function(feat) {
+    obs <- risk_cor_results$rho[risk_cor_results$Feature == feat]
+    perm <- na.omit(perm_risk_cor[, feat])
+    (sum(abs(perm) >= abs(obs)) + 1) / (length(perm) + 1)
+  })
+  risk_perm_results <- data.frame(
+    Immune_Feature = colnames(immuno_scores),
+    Observed_rho = risk_cor_results$rho,
+    Permutation_Mean = colMeans(perm_risk_cor, na.rm = TRUE),
+    Empirical_P = risk_empirical_p
+  )
+  write.csv(risk_perm_results, file.path(PROJECT_DIR, "Table_Risk_Score_Permutation.csv"), row.names = FALSE)
+  print(risk_perm_results)
+} else {
+  cat("Too few risk genes to run risk score analysis\n")
+}
+
+# ---------- 16. Figure generation (heatmap) ----------
+if (exists("protective_score") && exists("immune_scores")) {
+  cor_mat <- cor(cbind(protective_score = protective_score, immune_scores),
+                 method = "spearman",
+                 use = "pairwise.complete.obs")
+  pheatmap(cor_mat,
+           display_numbers = TRUE,
+           number_format = "%.2f",
+           color = colorRampPalette(c("#2166AC", "white", "#B2182B"))(100),
+           main = "Protective Score vs Immune Features",
+           filename = file.path(FIG_DIR, "Figure3_Heatmap.pdf"),
+           width = 8, height = 7)
+  cat("✅ Heatmap saved as Figure3_Heatmap.pdf\n")
+} else {
+  warning("protective_score or immune_scores not found; heatmap skipped.")
+}
+
+# Optional: Permutation distribution histogram for B-cell feature
+if (exists("perm_cor_matrix") && exists("real_cor")) {
+  feat_plot <- "B_cell"
+  observed_val <- real_cor[feat_plot]
+  perm_vals <- na.omit(perm_cor_matrix[, feat_plot])
+  pdf(file.path(FIG_DIR, "Figure_Permutation_Histogram_B_cell.pdf"), width = 7, height = 5)
+  hist(perm_vals, breaks = 30,
+       main = paste("Permutation Test:", feat_plot),
+       xlab = "Spearman rho", col = "skyblue", border = "white",
+       xlim = range(c(perm_vals, observed_val)))
+  abline(v = observed_val, col = "red", lwd = 2, lty = 2)
+  legend("topright",
+         legend = c("Null distribution", paste0("Observed (ρ = ", round(observed_val, 3), ")")),
+         col = c("skyblue", "red"), lwd = c(NA, 2),
+         fill = c("skyblue", NA), border = c("black", NA), lty = c(NA, 2))
+  dev.off()
+  cat("✅ Permutation histogram saved.\n")
+}
+
+cat("\n========== TCGA re-download and immune association analysis complete ==========\n")
 # ========================== 8. Supplementary figures==============================
 
 library(ggplot2)
